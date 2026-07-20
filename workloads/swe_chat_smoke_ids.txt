@@ -1,0 +1,2 @@
+# Two-request Claude Code trace used by the replay and 3P1D smoke tests.
+1f820de7-15ef-41c7-9e86-e816c90198a8
