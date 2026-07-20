@@ -25,6 +25,7 @@ test = [
 ]
 [project.scripts]
 trie = "trie.cli:main"
+trie-swe-chat = "trie.swe_chat:main"
 
 [build-system]
 requires = ["uv_build>=0.9.18,<0.10.0"]
