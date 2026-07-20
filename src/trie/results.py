@@ -77,19 +77,33 @@ class ServerMetrics:
     prompt_tokens: int = 0
     cached_tokens: int = 0
     eligible_prompt_tokens: int = 0
+    eligible_cached_tokens: int = 0
     _next_request_eligible_prompt_tokens: int = field(default=0, init=False, repr=False)
 
-    def record_usage(self, usage: CompletionUsage) -> None:
+    def record_usage(
+        self,
+        usage: CompletionUsage,
+        *,
+        eligible_prompt_tokens: int | None = None,
+    ) -> int:
         self.prompt_tokens += usage.prompt_tokens
-        self.cached_tokens += (
+        cached_tokens = (
             usage.prompt_tokens_details.cached_tokens
             if usage.prompt_tokens_details and usage.prompt_tokens_details.cached_tokens
             else 0
         )
-        self.eligible_prompt_tokens += self._next_request_eligible_prompt_tokens
+        self.cached_tokens += cached_tokens
+        eligible = (
+            self._next_request_eligible_prompt_tokens
+            if eligible_prompt_tokens is None
+            else eligible_prompt_tokens
+        )
+        self.eligible_prompt_tokens += eligible
+        self.eligible_cached_tokens += min(cached_tokens, eligible)
         self._next_request_eligible_prompt_tokens = (
             usage.prompt_tokens + usage.completion_tokens
         )
+        return cached_tokens
 
     @property
     def cache_hit_rate(self) -> float:
@@ -98,7 +112,7 @@ class ServerMetrics:
     @property
     def eligible_cache_hit_rate(self) -> float:
         return (
-            self.cached_tokens / self.eligible_prompt_tokens
+            self.eligible_cached_tokens / self.eligible_prompt_tokens
             if self.eligible_prompt_tokens
             else 0.0
         )
@@ -109,7 +123,9 @@ class BenchmarkResult:
     """Aggregated metrics from a benchmark run."""
 
     wall_time: float = 0.0
+    expected_requests: int | None = None
     completed_requests: int = 0
+    completed_model_requests: int = 0
     failed_requests: int = 0
     latencies: list[float] = field(default_factory=list)
     ttfts: list[float] = field(default_factory=list)
@@ -118,6 +134,9 @@ class BenchmarkResult:
     inter_token_latencies_ms: list[float] = field(default_factory=list)
     points: list[CompletionPoint] = field(default_factory=list)
     server_metrics: list[ServerMetrics] = field(default_factory=list)
+    client_prefix_tokens: list[int] = field(default_factory=list)
+    block_aligned_prefix_tokens: list[int] = field(default_factory=list)
+    server_cached_tokens: list[int] = field(default_factory=list)
 
     def _append_point(
         self,
@@ -157,6 +176,7 @@ class BenchmarkResult:
             cached_prompt_tokens=workload.cumulative_prompt_tokens(turn_index)
             - new_prompt_tokens,
         )
+        self.completed_model_requests += 1
 
     def record_success(
         self,
@@ -176,6 +196,33 @@ class BenchmarkResult:
             cached_prompt_tokens=workload.cumulative_prompt_tokens(len(workload.turns))
             - new_prompt_tokens,
         )
+        self.latencies.append(latency)
+        self.completed_requests += 1
+        self.completed_model_requests += 1
+
+    def record_replay_request(
+        self,
+        *,
+        timestamp: float,
+        prompt_tokens: int,
+        completion_tokens: int,
+        client_prefix_tokens: int,
+        block_aligned_prefix_tokens: int,
+        server_cached_tokens: int,
+    ) -> None:
+        actual_cached = min(max(server_cached_tokens, 0), prompt_tokens)
+        self._append_point(
+            timestamp=timestamp,
+            completion_tokens=completion_tokens,
+            new_prompt_tokens=prompt_tokens - actual_cached,
+            cached_prompt_tokens=actual_cached,
+        )
+        self.completed_model_requests += 1
+        self.client_prefix_tokens.append(client_prefix_tokens)
+        self.block_aligned_prefix_tokens.append(block_aligned_prefix_tokens)
+        self.server_cached_tokens.append(server_cached_tokens)
+
+    def record_trace_success(self, latency: float) -> None:
         self.latencies.append(latency)
         self.completed_requests += 1
 

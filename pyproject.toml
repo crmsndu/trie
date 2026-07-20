@@ -12,6 +12,7 @@ classifiers = [
 ]
 dependencies = [
     "chz",
+    "jinja2",
     "numpy",
     "openai",
     "rich",

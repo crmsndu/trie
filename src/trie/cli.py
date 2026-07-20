@@ -1,4 +1,5 @@
 import logging
+from typing import Literal
 
 import chz
 import structlog
@@ -49,6 +50,46 @@ class RunArgs:
         default=False,
         doc="Use streaming completions and report TTFT, TTFAT, and TPS per trace.",
     )
+    delay_scale: float = chz.field(
+        default=1.0,
+        doc="Scale recorded user/tool waits; 0 disables waits and 1 replays real time.",
+    )
+    max_user_delay: float | None = chz.field(
+        default=None,
+        doc="Optional cap in seconds applied to each recorded user wait.",
+    )
+    max_tool_delay: float | None = chz.field(
+        default=None,
+        doc="Optional cap in seconds applied to each recorded tool wait.",
+    )
+    context_source: Literal["generated", "recorded"] = chz.field(
+        default="generated",
+        doc="Use live model output or recorded assistant output in the next prompt.",
+    )
+    prefix_block_size: int = chz.field(
+        default=16,
+        doc="Token block size used for client-side prefix-cache overlap metrics.",
+    )
+    cache_salt_mode: Literal["global", "session"] = chz.field(
+        default="session",
+        doc="Share vLLM prefix cache globally or isolate it by replay session.",
+    )
+    workload_order: Literal["natural", "shuffle", "prefix"] = chz.field(
+        default="natural",
+        doc="Trace ordering; prefix is a cache-locality upper-bound experiment.",
+    )
+    prefix_sort_tokens: int = chz.field(
+        default=256,
+        doc="Initial prompt tokens used when workload_order=prefix.",
+    )
+    replay_once: bool = chz.field(
+        default=False,
+        doc="Admit each trace once instead of cycling the workload until duration.",
+    )
+    drain_timeout: float = chz.field(
+        default=0.0,
+        doc="Seconds to drain in-flight traces after admission stops; 0 cancels immediately.",
+    )
 
     @chz.validate
     def _validate_fields(self) -> None:
@@ -65,6 +106,18 @@ class RunArgs:
             raise ValueError("timeout must be greater than 0")
         if self.num_gpus is not None and self.num_gpus < 1:
             raise ValueError("num_gpus must be at least 1")
+        if self.delay_scale < 0:
+            raise ValueError("delay_scale must be non-negative")
+        if self.max_user_delay is not None and self.max_user_delay < 0:
+            raise ValueError("max_user_delay must be non-negative")
+        if self.max_tool_delay is not None and self.max_tool_delay < 0:
+            raise ValueError("max_tool_delay must be non-negative")
+        if self.prefix_block_size <= 0:
+            raise ValueError("prefix_block_size must be greater than 0")
+        if self.prefix_sort_tokens <= 0:
+            raise ValueError("prefix_sort_tokens must be greater than 0")
+        if self.drain_timeout < 0:
+            raise ValueError("drain_timeout must be non-negative")
 
 
 def main() -> None:
@@ -95,6 +148,16 @@ def main() -> None:
         duration_update_interval=args.duration_update_interval,
         num_gpus=args.num_gpus,
         stream=args.stream,
+        delay_scale=args.delay_scale,
+        max_user_delay=args.max_user_delay,
+        max_tool_delay=args.max_tool_delay,
+        context_source=args.context_source,
+        prefix_block_size=args.prefix_block_size,
+        cache_salt_mode=args.cache_salt_mode,
+        workload_order=args.workload_order,
+        prefix_sort_tokens=args.prefix_sort_tokens,
+        replay_once=args.replay_once,
+        drain_timeout=args.drain_timeout,
     )
 
 

@@ -1,4 +1,5 @@
 import os
+from typing import Any
 
 import numpy as np
 import structlog
@@ -28,8 +29,32 @@ class TokenizerManager:
     def _encode(self, text: str) -> list[int]:
         return self._tokenizer(text, add_special_tokens=False).input_ids
 
+    def encode(self, text: str) -> list[int]:
+        return self._encode(text)
+
+    def decode(self, token_ids: list[int]) -> str:
+        return self._decode(token_ids)
+
     def count_tokens(self, text: str) -> int:
         return len(self._encode(text))
+
+    def render_chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        add_generation_prompt: bool = True,
+    ) -> str:
+        kwargs: dict[str, Any] = {
+            "tokenize": False,
+            "add_generation_prompt": add_generation_prompt,
+        }
+        if tools is not None:
+            kwargs["tools"] = tools
+        rendered = self._tokenizer.apply_chat_template(messages, **kwargs)
+        if not isinstance(rendered, str):
+            raise TypeError("chat template did not return text")
+        return rendered
 
     def _sample_token_ids(self, prompt_length: int) -> list[int]:
         return self._rng.integers(

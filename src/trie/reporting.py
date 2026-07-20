@@ -60,7 +60,9 @@ def build_progress_lines(
             (
                 "Running benchmark  "
                 f"elapsed={_format_elapsed(elapsed)}/{_format_elapsed(duration)}  "
-                f"completed={result.completed_requests}  trace/s={trace_rate:.2f}"
+                f"completed={result.completed_requests}  "
+                f"model_requests={result.completed_model_requests}  "
+                f"trace/s={trace_rate:.2f}"
             ),
             _format_progress_rate_line(
                 "overall:  ", _overall_progress_rates(result, elapsed)
@@ -122,7 +124,9 @@ def _build_workload_metrics_table(
 
 def log_summary(result: BenchmarkResult, num_gpus: int | None = None) -> None:
     wall_time = result.wall_time
-    total_requests = result.completed_requests + result.failed_requests
+    total_requests = result.expected_requests or (
+        result.completed_requests + result.failed_requests
+    )
     trace_s = result.completed_requests / wall_time if wall_time > 0 else 0.0
 
     rows: list[tuple[str, float, float, float, float | None]] = []
@@ -205,6 +209,24 @@ def log_summary(result: BenchmarkResult, num_gpus: int | None = None) -> None:
             ".1f",
             [m.eligible_cache_hit_rate * 100 for m in result.server_metrics],
         ),
+        (
+            "Client prefix overlap (tok)",
+            "client_prefix_tokens",
+            ".0f",
+            result.client_prefix_tokens,
+        ),
+        (
+            "Block-aligned prefix (tok)",
+            "block_aligned_prefix_tokens",
+            ".0f",
+            result.block_aligned_prefix_tokens,
+        ),
+        (
+            "Server cached prompt (tok)",
+            "server_cached_tokens",
+            ".0f",
+            result.server_cached_tokens,
+        ),
     ):
         if not values:
             continue
@@ -218,6 +240,8 @@ def log_summary(result: BenchmarkResult, num_gpus: int | None = None) -> None:
         "benchmark complete",
         wall_time_s=wall_time,
         completed_requests=result.completed_requests,
+        expected_requests=result.expected_requests,
+        completed_model_requests=result.completed_model_requests,
         failed_requests=result.failed_requests,
         **workload_metrics,
         **dist_log_metrics,
