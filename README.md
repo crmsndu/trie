@@ -116,6 +116,9 @@ reuse during both the direct and replay phases, and zero NIXL
 transfer/notification failures. It is a correctness smoke, not a serving
 pressure benchmark. Artifacts are written under `/tmp/trie-vllm-3p1d.smoke.*`.
 
+A four-trace grouped MiniMax verification is recorded in
+[workloads/swe_chat_long_batch_report.md](workloads/swe_chat_long_batch_report.md).
+
 Stop the platform with:
 
 ```bash
