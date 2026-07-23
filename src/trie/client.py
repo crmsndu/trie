@@ -152,13 +152,19 @@ class Client:
         stream_acc: StreamAccumulator,
         cache_salt: str | None = None,
         return_token_ids: bool = False,
+        deterministic_sampling: bool = False,
     ) -> GenerationResult:
         request_start = time.perf_counter()
         extra_body: dict[str, object] = {"ignore_eos": True}
         if return_token_ids:
             extra_body["return_token_ids"] = True
+        if deterministic_sampling:
+            extra_body["top_k"] = 1
         if cache_salt is not None:
             extra_body["cache_salt"] = cache_salt
+        request_kwargs: dict[str, object] = {}
+        if deterministic_sampling:
+            request_kwargs.update(temperature=0.0, top_p=1.0)
         stream = await self._client.completions.create(
             model=self._model,
             prompt=prompt,
@@ -166,6 +172,7 @@ class Client:
             stream=True,
             stream_options={"include_usage": True},
             extra_body=extra_body,
+            **request_kwargs,
         )
         text_parts: list[str] = []
         last_token_at_s: float | None = None
@@ -280,6 +287,7 @@ class Client:
         stream_acc: StreamAccumulator,
         cache_salt: str | None = None,
         return_token_ids: bool = False,
+        deterministic_sampling: bool = False,
     ) -> GenerationResult:
         if stream:
             return await self._execute_stream_request(
@@ -289,18 +297,25 @@ class Client:
                 stream_acc=stream_acc,
                 cache_salt=cache_salt,
                 return_token_ids=return_token_ids,
+                deterministic_sampling=deterministic_sampling,
             )
 
         extra_body: dict[str, object] = {"ignore_eos": True}
         if return_token_ids:
             extra_body["return_token_ids"] = True
+        if deterministic_sampling:
+            extra_body["top_k"] = 1
         if cache_salt is not None:
             extra_body["cache_salt"] = cache_salt
+        request_kwargs: dict[str, object] = {}
+        if deterministic_sampling:
+            request_kwargs.update(temperature=0.0, top_p=1.0)
         response = await self._client.completions.create(
             model=self._model,
             prompt=prompt,
             max_tokens=max_tokens,
             extra_body=extra_body,
+            **request_kwargs,
         )
         if response.usage is None:
             raise ValueError("response.usage must not be None")
@@ -451,6 +466,7 @@ class Client:
         prefix_block_size: int,
         cache_salt_mode: Literal["global", "session"],
         run_cache_salt: str | None,
+        strict_replay: bool = False,
     ) -> None:
         metrics = ServerMetrics()
         stream_acc = StreamAccumulator()
@@ -501,6 +517,7 @@ class Client:
                     stream_acc=stream_acc,
                     cache_salt=cache_salt,
                     return_token_ids=True,
+                    deterministic_sampling=strict_replay,
                 )
                 prompt_token_ids = generation.prompt_token_ids
                 generated_token_ids = generation.generated_token_ids
@@ -605,6 +622,7 @@ class Client:
         prefix_block_size: int,
         cache_salt_mode: Literal["global", "session"],
         run_cache_salt: str | None,
+        strict_replay: bool,
     ) -> None:
         if isinstance(workload, ReplayTrace):
             await self._run_replay_trace(
@@ -620,6 +638,7 @@ class Client:
                 prefix_block_size=prefix_block_size,
                 cache_salt_mode=cache_salt_mode,
                 run_cache_salt=run_cache_salt,
+                strict_replay=strict_replay,
             )
             return
         await self._run_legacy_workload(
@@ -679,6 +698,7 @@ class Client:
         prefix_sort_tokens: int = 256,
         replay_once: bool = False,
         drain_timeout: float = 0.0,
+        strict_replay: bool = False,
     ) -> BenchmarkResult:
         workload_list = self._order_workloads(
             load_workloads(workload),
@@ -713,6 +733,10 @@ class Client:
             raise ValueError("prefix_sort_tokens must be greater than 0")
         if drain_timeout < 0:
             raise ValueError("drain_timeout must be non-negative")
+        if strict_replay:
+            if any(not isinstance(item, ReplayTrace) for item in workload_list):
+                raise ValueError("strict_replay only supports schema-v2 replay traces")
+            context_source = "recorded"
         run_cache_salt = uuid.uuid4().hex if cache_salt_mode == "session" else None
         benchmark_log_fields = {
             "model": self._model,
@@ -725,6 +749,7 @@ class Client:
             "workload_order": workload_order,
             "replay_once": replay_once,
             "drain_timeout": drain_timeout,
+            "strict_replay": strict_replay,
         }
         if concurrency is not None:
             benchmark_log_fields["concurrency"] = concurrency
@@ -839,6 +864,7 @@ class Client:
                             prefix_block_size=prefix_block_size,
                             cache_salt_mode=cache_salt_mode,
                             run_cache_salt=run_cache_salt,
+                            strict_replay=strict_replay,
                         )
                     )
                 )
@@ -881,6 +907,7 @@ class Client:
         prefix_sort_tokens: int = 256,
         replay_once: bool = False,
         drain_timeout: float = 0.0,
+        strict_replay: bool = False,
     ) -> BenchmarkResult:
         try:
             return asyncio.run(
@@ -902,6 +929,7 @@ class Client:
                     prefix_sort_tokens=prefix_sort_tokens,
                     replay_once=replay_once,
                     drain_timeout=drain_timeout,
+                    strict_replay=strict_replay,
                 )
             )
         except KeyboardInterrupt:

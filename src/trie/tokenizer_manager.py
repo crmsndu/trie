@@ -1,4 +1,6 @@
+import json
 import os
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -6,7 +8,7 @@ import structlog
 
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 logger = structlog.get_logger(__name__)
 
@@ -15,9 +17,61 @@ class TokenizerManager:
     def __init__(self, model_name: str, seed: int | None = None) -> None:
         self._model_name = model_name
         self._rng = np.random.default_rng(seed)
-        self._tokenizer = AutoTokenizer.from_pretrained(
-            model_name, trust_remote_code=True
+        try:
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                model_name, trust_remote_code=True
+            )
+        except ValueError as exc:
+            if "Tokenizer class TokenizersBackend" not in str(exc):
+                raise
+            self._tokenizer = self._load_tokenizers_backend_fallback(model_name)
+
+    @staticmethod
+    def _load_tokenizers_backend_fallback(
+        model_name: str,
+    ) -> PreTrainedTokenizerFast:
+        """Load transformers-v5 TokenizersBackend artifacts on transformers v4.
+
+        GLM-5.2 declares ``TokenizersBackend`` in tokenizer_config.json. That
+        generic class exists in transformers v5, while trie intentionally pins
+        v4. Loading the same tokenizer.json and chat template directly avoids a
+        model-specific tokenizer dependency and keeps replay tokenization equal
+        to the server.
+        """
+        model_path = Path(model_name)
+        tokenizer_path = model_path / "tokenizer.json"
+        config_path = model_path / "tokenizer_config.json"
+        template_path = model_path / "chat_template.jinja"
+        if not tokenizer_path.is_file() or not config_path.is_file():
+            raise ValueError(
+                "TokenizersBackend fallback requires a local model directory "
+                "containing tokenizer.json and tokenizer_config.json"
+            )
+
+        with config_path.open("r", encoding="utf-8") as config_file:
+            config = json.load(config_file)
+        kwargs: dict[str, Any] = {
+            "tokenizer_file": str(tokenizer_path),
+            "clean_up_tokenization_spaces": config.get(
+                "clean_up_tokenization_spaces", False
+            ),
+        }
+        for field in ("bos_token", "eos_token", "unk_token", "pad_token"):
+            value = config.get(field)
+            if isinstance(value, (str, dict)):
+                kwargs[field] = value
+        model_max_length = config.get("model_max_length")
+        if isinstance(model_max_length, int):
+            kwargs["model_max_length"] = model_max_length
+        if template_path.is_file():
+            kwargs["chat_template"] = template_path.read_text(encoding="utf-8")
+
+        logger.info(
+            "loading generic TokenizersBackend artifact with "
+            "PreTrainedTokenizerFast",
+            model=model_name,
         )
+        return PreTrainedTokenizerFast(**kwargs)
 
     def _decode(self, token_ids: list[int]) -> str:
         return self._tokenizer.decode(

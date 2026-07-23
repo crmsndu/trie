@@ -231,6 +231,36 @@ def test_non_replay_stream_does_not_request_token_ids() -> None:
     assert completions.calls[0]["extra_body"] == {"ignore_eos": True}
 
 
+def test_deterministic_sampling_uses_greedy_parameters() -> None:
+    choice = CompletionChoice(
+        finish_reason="length",
+        index=0,
+        logprobs=None,
+        text="hi",
+        prompt_token_ids=[1, 2, 3],
+        token_ids=[32, 48],
+    )
+    response = SimpleNamespace(choices=[choice], usage=_usage(), model_extra={})
+    client, completions = _client(response)
+
+    asyncio.run(
+        client._execute_request(
+            "abc",
+            2,
+            stream=False,
+            trace_start=0.0,
+            stream_acc=StreamAccumulator(),
+            return_token_ids=True,
+            deterministic_sampling=True,
+        )
+    )
+
+    call = completions.calls[0]
+    assert call["temperature"] == 0.0
+    assert call["top_p"] == 1.0
+    assert call["extra_body"]["top_k"] == 1
+
+
 def test_extension_token_ids_supports_model_extra() -> None:
     value = SimpleNamespace(model_extra={"token_ids": [7, 8]})
 

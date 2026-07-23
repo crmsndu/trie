@@ -90,6 +90,13 @@ class RunArgs:
         default=0.0,
         doc="Seconds to drain in-flight traces after admission stops; 0 cancels immediately.",
     )
+    strict_replay: bool = chz.field(
+        default=False,
+        doc=(
+            "Replay schema-v2 traces with recorded context and greedy sampling. "
+            "This preserves the real P/D and MTP execution path."
+        ),
+    )
 
     @chz.validate
     def _validate_fields(self) -> None:
@@ -158,6 +165,7 @@ def main() -> None:
         prefix_sort_tokens=args.prefix_sort_tokens,
         replay_once=args.replay_once,
         drain_timeout=args.drain_timeout,
+        strict_replay=args.strict_replay,
     )
 
 
