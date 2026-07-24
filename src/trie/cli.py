@@ -1,10 +1,14 @@
+import json
 import logging
+import os
+from pathlib import Path
 from typing import Literal
 
 import chz
 import structlog
 
 from trie.client import Client
+from trie.reporting import build_json_summary
 
 
 @chz.chz
@@ -97,6 +101,10 @@ class RunArgs:
             "This preserves the real P/D and MTP execution path."
         ),
     )
+    output_json: str | None = chz.field(
+        default=None,
+        doc="Optional path for a machine-readable benchmark result.",
+    )
 
     @chz.validate
     def _validate_fields(self) -> None:
@@ -139,7 +147,7 @@ def main() -> None:
         wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
     )
 
-    Client(
+    result = Client(
         endpoint=args.endpoint,
         model=args.model,
         tokenizer_model=args.tokenizer_model,
@@ -167,6 +175,22 @@ def main() -> None:
         drain_timeout=args.drain_timeout,
         strict_replay=args.strict_replay,
     )
+    if args.output_json is not None:
+        output_path = Path(args.output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = output_path.with_name(
+            f".{output_path.name}.tmp-{os.getpid()}"
+        )
+        temporary_path.write_text(
+            json.dumps(
+                build_json_summary(result, num_gpus=args.num_gpus),
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        temporary_path.replace(output_path)
 
 
 if __name__ == "__main__":

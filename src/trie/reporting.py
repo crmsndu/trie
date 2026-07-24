@@ -1,3 +1,5 @@
+from typing import Any
+
 import numpy as np
 import structlog
 from rich.console import Console
@@ -82,6 +84,81 @@ def _percentile_stats(values: list[float]) -> dict[str, float]:
         "p95": float(p95),
         "p99": float(p99),
         "max": float(np.max(values)),
+    }
+
+
+def build_json_summary(
+    result: BenchmarkResult, num_gpus: int | None = None
+) -> dict[str, Any]:
+    """Build a stable, machine-readable benchmark result.
+
+    Keep the raw samples alongside aggregates so experiment analysis can be
+    changed without rerunning an expensive replay.
+    """
+    wall_time = result.wall_time
+    last_30s = result.last_30s_rates()
+    steady = result.steady_state_rates()
+
+    def rates(rates: Any) -> dict[str, float]:
+        return {
+            "prompt_tok_s": rates.prompt_tok_s,
+            "cached_prompt_tok_s": rates.cached_tok_s,
+            "new_prompt_tok_s": rates.new_prompt_tok_s,
+            "completion_tok_s": rates.completion_tok_s,
+        }
+
+    overall = {
+        "prompt_tok_s": _safe_rate(result.completed_prompt_tokens, wall_time),
+        "cached_prompt_tok_s": _safe_rate(result.cached_prompt_tokens, wall_time),
+        "new_prompt_tok_s": _safe_rate(result.new_prompt_tokens, wall_time),
+        "completion_tok_s": _safe_rate(
+            result.completed_completion_tokens, wall_time
+        ),
+    }
+    distributions = {
+        "latency_s": result.latencies,
+        "ttft_s": result.ttfts,
+        "ttfat_s": result.ttfats,
+        "decode_tpot_ms": [
+            1000.0 / value for value in result.tps_values if value > 0
+        ],
+        "inter_token_latency_ms": result.inter_token_latencies_ms,
+        "cache_hit_rate": [m.cache_hit_rate for m in result.server_metrics],
+        "eligible_cache_hit_rate": [
+            m.eligible_cache_hit_rate for m in result.server_metrics
+        ],
+        "client_prefix_tokens": result.client_prefix_tokens,
+        "block_aligned_prefix_tokens": result.block_aligned_prefix_tokens,
+        "server_cached_tokens": result.server_cached_tokens,
+    }
+    return {
+        "schema_version": 1,
+        "wall_time_s": wall_time,
+        "expected_requests": result.expected_requests,
+        "completed_requests": result.completed_requests,
+        "completed_model_requests": result.completed_model_requests,
+        "failed_requests": result.failed_requests,
+        "completed_prompt_tokens": result.completed_prompt_tokens,
+        "cached_prompt_tokens": result.cached_prompt_tokens,
+        "new_prompt_tokens": result.new_prompt_tokens,
+        "completed_completion_tokens": result.completed_completion_tokens,
+        "trace_per_s": _safe_rate(result.completed_requests, wall_time),
+        "throughput": {
+            "overall": overall,
+            "last_30s": rates(last_30s),
+            "steady_state": rates(steady),
+            "steady_state_per_gpu": (
+                {key: value / num_gpus for key, value in rates(steady).items()}
+                if num_gpus is not None
+                else None
+            ),
+        },
+        "distribution_summaries": {
+            key: _percentile_stats(values)
+            for key, values in distributions.items()
+            if values
+        },
+        "samples": distributions,
     }
 
 
