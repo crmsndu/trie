@@ -8,6 +8,104 @@ from tokenizers.pre_tokenizers import Whitespace
 from trie.tokenizer_manager import TokenizerManager
 
 
+class RecordingTokenizer:
+    def __init__(self) -> None:
+        self.messages = None
+        self.kwargs = None
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.messages = messages
+        self.kwargs = kwargs
+        return "rendered"
+
+
+def _recording_manager() -> tuple[TokenizerManager, RecordingTokenizer]:
+    manager = object.__new__(TokenizerManager)
+    tokenizer = RecordingTokenizer()
+    manager._tokenizer = tokenizer
+    return manager, tokenizer
+
+
+def test_render_chat_matches_sglang_tool_normalization() -> None:
+    manager, tokenizer = _recording_manager()
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "arguments": '{"query":"needle"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": [{"type": "text", "text": "one"}, "two"],
+        },
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search documents.",
+                "parameters": {"type": "object"},
+                "strict": True,
+            },
+        }
+    ]
+
+    assert manager.render_chat(messages, tools=tools) == "rendered"
+    assert tokenizer.messages[0]["content"] == ""
+    assert tokenizer.messages[0]["tool_calls"][0]["function"]["arguments"] == {
+        "query": "needle"
+    }
+    assert tokenizer.messages[1]["content"] == "one two"
+    assert list(tokenizer.kwargs["tools"][0]["function"]) == [
+        "description",
+        "name",
+        "parameters",
+        "strict",
+    ]
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == (
+        '{"query":"needle"}'
+    )
+
+
+def test_render_chat_rejects_invalid_tool_call_arguments() -> None:
+    manager, _ = _recording_manager()
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {"name": "search", "arguments": "[]"},
+                }
+            ],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        manager.render_chat(messages)
+
+
+def test_render_chat_forwards_reasoning_effort() -> None:
+    manager, tokenizer = _recording_manager()
+
+    manager.render_chat(
+        [{"role": "user", "content": "hello"}],
+        reasoning_effort="high",
+    )
+
+    assert tokenizer.kwargs["reasoning_effort"] == "high"
+
+
 def test_tokenizers_backend_fallback_loads_local_artifacts(
     monkeypatch, tmp_path
 ) -> None:

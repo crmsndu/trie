@@ -120,6 +120,8 @@ def _validate_token_id_counts(
 class Client:
     """Runs synthetic multi-turn workloads against an OpenAI-compatible endpoint."""
 
+    _reasoning_effort: str | None = None
+
     def __init__(
         self,
         endpoint: str,
@@ -129,6 +131,7 @@ class Client:
         seed: int | None = None,
         max_retries: int = 2,
         timeout: float = 600.0,
+        reasoning_effort: str | None = None,
     ) -> None:
         self._model = model
         self._client = AsyncOpenAI(
@@ -138,6 +141,7 @@ class Client:
             timeout=timeout,
         )
         self._tokenizer_manager = TokenizerManager(tokenizer_model or model, seed=seed)
+        self._reasoning_effort = reasoning_effort
         self._seed = seed
         self._rng = random.Random(seed)
         self._result: BenchmarkResult | None = None
@@ -508,6 +512,7 @@ class Client:
                     messages,
                     tools=trace.tools,
                     add_generation_prompt=True,
+                    reasoning_effort=self._reasoning_effort,
                 )
                 generation = await self._execute_request(
                     prompt,
@@ -670,6 +675,7 @@ class Client:
                 workload.initial_messages,
                 tools=workload.tools,
                 add_generation_prompt=True,
+                reasoning_effort=self._reasoning_effort,
             )
             return (
                 0,

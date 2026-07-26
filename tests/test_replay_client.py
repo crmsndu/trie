@@ -8,7 +8,14 @@ from trie.types import AppendMessage, Generate, ReplayTrace, ReplaceContext, Wai
 
 
 class SimpleTokenizer:
-    def render_chat(self, messages, *, tools=None, add_generation_prompt=True):
+    def render_chat(
+        self,
+        messages,
+        *,
+        tools=None,
+        add_generation_prompt=True,
+        reasoning_effort=None,
+    ):
         rendered = "".join(
             (
                 f"<{message['role']}>{message.get('content') or ''}"

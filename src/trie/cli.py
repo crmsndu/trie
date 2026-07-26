@@ -22,6 +22,12 @@ class RunArgs:
         default=None,
         doc="Optional model name override for loading tokenizer.",
     )
+    reasoning_effort: Literal["none", "low", "medium", "high", "max"] | None = (
+        chz.field(
+            default=None,
+            doc="Optional reasoning effort forwarded to the local chat template.",
+        )
+    )
     duration: float = chz.field(
         default=300.0,
         doc="Duration in seconds to run the benchmark.",
@@ -155,6 +161,7 @@ def main() -> None:
         seed=args.seed,
         max_retries=args.max_retries,
         timeout=args.timeout,
+        reasoning_effort=args.reasoning_effort,
     ).sync_run(
         args.workload_path,
         concurrency=args.concurrency,

@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 from pathlib import Path
@@ -98,17 +99,102 @@ class TokenizerManager:
         *,
         tools: list[dict[str, Any]] | None = None,
         add_generation_prompt: bool = True,
+        reasoning_effort: str | None = None,
     ) -> str:
+        normalized_messages = self._normalize_messages_for_sglang(messages)
         kwargs: dict[str, Any] = {
             "tokenize": False,
             "add_generation_prompt": add_generation_prompt,
+            "return_dict": False,
         }
         if tools is not None:
-            kwargs["tools"] = tools
-        rendered = self._tokenizer.apply_chat_template(messages, **kwargs)
+            kwargs["tools"] = self._normalize_tools_for_sglang(tools)
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
+        rendered = self._tokenizer.apply_chat_template(normalized_messages, **kwargs)
         if not isinstance(rendered, str):
             raise TypeError("chat template did not return text")
         return rendered
+
+    @staticmethod
+    def _normalize_messages_for_sglang(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        normalized = copy.deepcopy(messages)
+        for message in normalized:
+            if message.get("content") is None:
+                message["content"] = ""
+
+            if message.get("role") == "assistant":
+                for tool_call in message.get("tool_calls") or []:
+                    function = (
+                        tool_call.get("function")
+                        if isinstance(tool_call, dict)
+                        else None
+                    )
+                    if not isinstance(function, dict) or not isinstance(
+                        function.get("arguments"), str
+                    ):
+                        continue
+                    try:
+                        arguments = json.loads(function["arguments"])
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            "assistant tool call function.arguments must be valid JSON"
+                        ) from exc
+                    if not isinstance(arguments, dict):
+                        raise ValueError(
+                            "assistant tool call function.arguments must be a JSON object"
+                        )
+                    function["arguments"] = arguments
+
+            content = message.get("content")
+            if message.get("role") == "tool" and isinstance(content, list):
+                if all(
+                    isinstance(part, str)
+                    or (
+                        isinstance(part, dict)
+                        and part.get("type") == "text"
+                    )
+                    for part in content
+                ):
+                    message["content"] = " ".join(
+                        part if isinstance(part, str) else part.get("text", "")
+                        for part in content
+                    )
+        return normalized
+
+    @staticmethod
+    def _normalize_tools_for_sglang(
+        tools: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        normalized = []
+        for tool in tools:
+            function = tool.get("function")
+            if not isinstance(function, dict):
+                raise ValueError("tool.function must be an object")
+            name = function.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError("tool.function.name must be a non-empty string")
+
+            normalized_function = {
+                "description": function.get("description"),
+                "name": name,
+                "parameters": copy.deepcopy(function.get("parameters")),
+                "strict": bool(function.get("strict", False)),
+            }
+            defer_loading = function.get("defer_loading")
+            if defer_loading is None:
+                defer_loading = tool.get("defer_loading")
+            if defer_loading is not None:
+                normalized_function["defer_loading"] = defer_loading
+            normalized.append(
+                {
+                    "type": tool.get("type", "function"),
+                    "function": normalized_function,
+                }
+            )
+        return normalized
 
     def _sample_token_ids(self, prompt_length: int) -> list[int]:
         return self._rng.integers(
