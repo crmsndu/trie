@@ -35,6 +35,9 @@ class SimpleTokenizer:
     def decode(self, token_ids: list[int]) -> str:
         return bytes(token_ids).decode()
 
+    def eos_token_id(self) -> int:
+        return 0
+
 
 class FakeClient(Client):
     def __init__(self, outputs: list[str | tuple[str, list[int]]]) -> None:
@@ -46,10 +49,17 @@ class FakeClient(Client):
         self._outputs = iter(outputs)
         self.prompts: list[str] = []
         self.cache_salts: list[str | None] = []
+        self.max_tokens: list[int] = []
+        self.forced_output_token_ids: list[list[int] | None] = []
 
     async def _execute_request(self, prompt, max_tokens, **kwargs):
         self.prompts.append(prompt)
         self.cache_salts.append(kwargs.get("cache_salt"))
+        self.max_tokens.append(max_tokens)
+        forced_ids = kwargs.get("forced_output_token_ids")
+        self.forced_output_token_ids.append(
+            list(forced_ids) if forced_ids is not None else None
+        )
         output = next(self._outputs)
         if isinstance(output, tuple):
             text, generated_token_ids = output
@@ -229,6 +239,83 @@ def test_recorded_context_uses_recorded_output() -> None:
     client, _ = _run_context_source("recorded")
     assert "recorded-one" in client.prompts[1]
     assert "live-one" not in client.prompts[1]
+
+
+def test_strict_replay_sends_canonical_fixed_length_token_ids() -> None:
+    expected_ids = list(b"abc") + [0]
+    client = FakeClient([("abc", expected_ids)])
+    result = BenchmarkResult()
+    trace = ReplayTrace(
+        trace_id="strict-canonical",
+        initial_messages=[{"role": "user", "content": "hello"}],
+        events=[
+            Generate(
+                max_tokens=4,
+                recorded_assistant={"role": "assistant", "content": "abc"},
+            )
+        ],
+    )
+
+    asyncio.run(
+        client._run_replay_trace(
+            trace,
+            benchmark_start=0.0,
+            result=result,
+            stream=False,
+            refresh=lambda: None,
+            delay_scale=0.0,
+            max_user_delay=None,
+            max_tool_delay=None,
+            context_source="recorded",
+            prefix_block_size=1,
+            cache_salt_mode="session",
+            run_cache_salt="run-1",
+            strict_replay=True,
+        )
+    )
+
+    assert client.max_tokens == [4]
+    assert client.forced_output_token_ids == [expected_ids]
+    assert result.completed_requests == 1
+    assert result.failed_requests == 0
+
+
+def test_strict_replay_prefers_recorded_output_token_ids() -> None:
+    expected_ids = [501, 502]
+    client = FakeClient([("ignored", expected_ids)])
+    result = BenchmarkResult()
+    trace = ReplayTrace(
+        trace_id="strict-exact",
+        initial_messages=[{"role": "user", "content": "hello"}],
+        events=[
+            Generate(
+                max_tokens=2,
+                recorded_assistant={"role": "assistant", "content": "different"},
+                recorded_output_token_ids=expected_ids,
+            )
+        ],
+    )
+
+    asyncio.run(
+        client._run_replay_trace(
+            trace,
+            benchmark_start=0.0,
+            result=result,
+            stream=False,
+            refresh=lambda: None,
+            delay_scale=0.0,
+            max_user_delay=None,
+            max_tool_delay=None,
+            context_source="recorded",
+            prefix_block_size=1,
+            cache_salt_mode="session",
+            run_cache_salt="run-1",
+            strict_replay=True,
+        )
+    )
+
+    assert client.forced_output_token_ids == [expected_ids]
+    assert result.completed_requests == 1
 
 
 def test_event_delay_applies_actor_caps_before_scaling() -> None:

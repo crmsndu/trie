@@ -93,6 +93,12 @@ class TokenizerManager:
     def count_tokens(self, text: str) -> int:
         return len(self._encode(text))
 
+    def eos_token_id(self) -> int:
+        token_id = self._tokenizer.eos_token_id
+        if not isinstance(token_id, int):
+            raise ValueError("tokenizer must define one primary EOS token ID")
+        return token_id
+
     def render_chat(
         self,
         messages: list[dict[str, Any]],

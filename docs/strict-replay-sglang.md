@@ -2,80 +2,118 @@
 
 ## Scope
 
-This implementation makes repeated runs follow the same recorded conversation
-without changing trie's schema-v2 trace format. It aims to reproduce the system
-workload closely enough for P/D, prefill CP, MLA KV-cache, and MTP experiments;
-it does not claim bit-exact kernel scheduling or fully deterministic MTP
-acceptance.
+Strict replay makes repeated benchmark runs commit the same output token stream
+to SGLang's scheduler, KV cache, and subsequent prompts. It is intended for
+controlled P/D, prefill CP, MLA KV-cache, DSA, and MTP comparisons.
 
-Use `strict_replay=True` (CLI: `strict_replay=true`). The mode:
+Use `strict_replay=true`. Before the benchmark timer starts, the client:
 
 1. accepts only schema-v2 `ReplayTrace` workloads;
-2. always builds later prompts from `recorded_assistant`;
-3. keeps each event's recorded `max_tokens` and sends `ignore_eos=true`;
-4. uses greedy target sampling (`temperature=0`, `top_p=1`, `top_k=1`);
-5. still runs the real target model, P/D transfer, cache lookup, and MTP path;
-6. asks SGLang for its authoritative prompt and generated token IDs.
+2. builds every later prompt from `recorded_assistant`;
+3. resolves one fixed output-token sequence for every generate event;
+4. sends that sequence as `forced_output_token_ids`;
+5. uses greedy target sampling (`temperature=0`, `top_p=1`, `top_k=1`);
+6. verifies that SGLang returned exactly the requested token IDs.
 
-The trace data structure is unchanged.
+SGLang still executes the target model, scheduler, P/D transfer, cache lookup,
+DSA path, and MTP draft model. Strict replay controls which generated tokens
+are committed; it does not bypass those system paths.
+
+## Trace format
+
+Schema v2 generate events can store the original output IDs:
+
+```json
+{
+  "type": "generate",
+  "max_tokens": 3,
+  "recorded_assistant": {
+    "role": "assistant",
+    "content": "Done."
+  },
+  "recorded_output_token_ids": [123, 456, 2]
+}
+```
+
+`recorded_output_token_ids` is optional for compatibility, but when present it
+must contain exactly `max_tokens` non-negative integer IDs. New trace collectors
+should populate it: this is the only way to reproduce the original generation
+bit-for-bit without depending on reversible text parsing.
+
+For an old text-only trace, Trie deterministically constructs an equal-length
+canonical sequence before timing starts. It tokenizes the recorded assistant
+continuation, truncates it if necessary, and otherwise pads it to the recorded
+`max_tokens`. The final missing token is inferred as EOS or, for a tool turn,
+from the separator at the start of the next recorded prompt. Trie logs how many
+events required this ambiguous reconstruction.
+
+That fallback gives every compared run the same token IDs and generation
+lengths, but it cannot recover IDs that were discarded by the old collector.
+It is therefore suitable for stable A/B system measurements, not for claiming
+bit-exact reproduction of the original collection run.
 
 ## SGLang extension
 
 SGLang's OpenAI-compatible `/v1/completions` endpoint accepts:
 
 ```json
-{"return_token_ids": true}
+{
+  "forced_output_token_ids": [123, 456, 2],
+  "return_token_ids": true
+}
 ```
 
-For a non-streaming response, each choice includes:
+`forced_output_token_ids` sets `max_new_tokens` to the sequence length and
+disables early EOS termination. For a non-streaming response, each choice
+includes:
 
 ```json
 {
   "prompt_token_ids": [1, 2, 3],
-  "token_ids": [4, 5]
+  "token_ids": [123, 456, 2]
 }
 ```
 
 For streaming responses, `prompt_token_ids` appears on the first choice chunk
-and `token_ids` contains only the IDs emitted by that chunk. The request is
-translated to SGLang's existing `return_prompt_token_ids` internal field, so no
-new scheduler or KV-cache data structure is introduced. The fields also pass
+and `token_ids` contains only the IDs emitted by that chunk. These fields pass
 through the P/D gateway as ordinary JSON.
 
-Trie requires these IDs during replay. It uses the server-tokenized prompt and
-the actual generated IDs to calculate exact and block-aligned reusable-prefix
-lengths. Missing or inconsistent IDs fail that trace rather than silently using
-a local token-count approximation.
+Trie uses the authoritative IDs to calculate the exact and block-aligned
+reusable prefix. A missing, malformed, or mismatched sequence fails the trace
+instead of silently using a local token-count approximation.
 
-## Why MTP is intentionally approximate
+## MTP semantics
 
-Strict mode does not inject recorded target tokens and does not force an MTP
-draft/accept schedule. With greedy target sampling, repeated target outputs
-should normally be stable, while MTP continues to perform natural drafting and
-verification. Hardware-level nondeterminism can still change an output or an
-accepted draft length.
+For greedy strict replay, SGLang computes target logits and the natural greedy
+target prediction as usual. Immediately before tree verification, it substitutes
+the trace token at each active forced-output position:
 
-When that happens, the current request still measures the real execution. The
-next request returns to the recorded conversation, and the client computes cache
-reuse against the actual preceding token IDs. This bounds model-output drift
-without replacing the system path being measured.
+- a draft token equal to the trace token is accepted;
+- the first unequal draft token rejects that draft suffix;
+- the trace token is emitted through the verifier's bonus-token path.
+
+The normal strict replay path calls the tree verifier once per decode step.
+This preserves meaningful MTP hit/miss work while guaranteeing that the tokens
+committed to the request and KV cache match the trace. MTP acceptance rates may
+differ from the source collection run because the draft model and runtime are
+still live.
 
 ## Expected reproducibility
 
 Stable across repeats:
 
 - rendered prompts after every recorded event;
-- requested generation lengths;
-- target sampling policy;
-- trace timing inputs, subject to the configured delay scaling;
-- client-side prefix accounting based on server token IDs.
+- committed output token IDs and generation lengths;
+- exact and block-aligned client prefix accounting;
+- request count and causal trace structure;
+- trace timing inputs, subject to configured delay scaling.
 
 Allowed to vary:
 
 - latency and concurrent scheduling;
 - P/D routing unless separately pinned;
 - cache residency under contention;
-- floating-point tie behavior;
+- kernel timing and floating-point behavior;
 - MTP proposals and accepted lengths.
 
 For low-noise comparison, use `replay_once=true`, a fixed concurrency/arrival
@@ -84,38 +122,26 @@ one untimed warm-up run.
 
 ## Verification
 
-- Trie unit suite: `uv run --extra test pytest -q tests`
-- SGLang completion unit:
-  `PYTHONPATH=sglang/python:sglang <python> sglang/test/registered/unit/entrypoints/openai/test_serving_completions.py -v`
+- Trie: `uv run --extra test pytest -q tests`
+- SGLang: run the forced replay, sampling, and completion unit suites.
 
 An end-to-end run should verify:
 
-1. every replay request returns prompt and output IDs;
-2. completion length equals the event's recorded `max_tokens`;
-3. repeat runs have identical request counts and prompt-token counts;
-4. any remaining output/cache/latency variance is reported rather than hidden.
+1. every request returns prompt and output IDs;
+2. every output-ID sequence exactly matches the prepared trace sequence;
+3. completion length equals the event's recorded `max_tokens`;
+4. repeat runs have identical request counts, prompts, outputs, and prefix
+   lengths;
+5. latency, routing, cache-residency, and MTP-acceptance variance remains visible.
 
-## 2026-07-23 B200 smoke result
+## 2026-07-27 B200 smoke result
 
-The implementation was exercised on a two-node 1P1D deployment:
+The current implementation was exercised with GLM-5.2-FP8 on one eight-GPU B200
+node using TP8, attention CP8, EP8, FP8 KV cache, DSA prefill/decode kernels,
+DSA CP shared KV, full decode CUDA graphs, and EAGLE MTP3.
 
-- prefill: `b200-dev-2`, TP8, Mooncake RDMA;
-- decode: `b200-dev`, TP8;
-- target and draft MoE: FlashInfer TRT-LLM;
-- MTP: EAGLE, 3 steps, top-k 1, 4 draft tokens;
-- workload: `swe_chat_smoke.jsonl`, one schema-v2 trace and two generate
-  events (`max_tokens` 80 and 99).
-
-The router's OpenAI completion response returned 6 authoritative prompt IDs and
-4 output IDs for a 6+4 token probe; both lengths matched `usage`.
-
-Two independent strict replay runs both completed 1/1 traces, 2/2 model
-requests, with zero failures. Both reported 113 total prompt tokens, 179
-completion tokens, the same client prefix lengths (0 and 31), and the same
-block-aligned prefix lengths (0 and 16). End-to-end trace latency differed
-(4.848 s versus 2.609 s), as expected after warm-up.
-
-Server logs confirmed real P/D transfers for all four replay requests (31 and
-82 prompt tokens in each repeat) and no transfer failures. MTP remained natural:
-observed decode-batch acceptance varied (for example, accept length 3.15/rate
-0.72 and 2.90/0.63), which is within this mode's documented tolerance.
+A two-turn strict replay trace was executed twice. Both runs returned exactly
+the forced token IDs at lengths 164 and 114. The second turn reported 832 cached
+prompt tokens in both runs, with the same 896-token client block-aligned prefix.
+End-to-end trace latency was 4.441 s and 4.380 s. Server logs showed live MTP
+acceptance and no replay mismatch.

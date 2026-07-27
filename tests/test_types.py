@@ -11,6 +11,7 @@ def test_replay_trace_round_trip() -> None:
             Generate(
                 max_tokens=4,
                 recorded_assistant={"role": "assistant", "content": "hi"},
+                recorded_output_token_ids=[11, 12, 13, 14],
             ),
             Wait(seconds=1.5, actor="user"),
             AppendMessage(message={"role": "user", "content": "again"}),
@@ -25,6 +26,16 @@ def test_replay_trace_round_trip() -> None:
     assert parsed.initial_messages == trace.initial_messages
     assert parsed.events == trace.events
     assert parsed.metadata == trace.metadata
+
+
+def test_recorded_output_token_ids_must_match_generation_length() -> None:
+    with pytest.raises(ValueError, match="length must equal max_tokens"):
+        Generate(max_tokens=2, recorded_output_token_ids=[1])
+
+
+def test_recorded_output_token_ids_must_be_non_negative_integers() -> None:
+    with pytest.raises(ValueError, match="non-negative integers"):
+        Generate(max_tokens=1, recorded_output_token_ids=[-1])
 
 
 def test_replay_trace_requires_generate() -> None:

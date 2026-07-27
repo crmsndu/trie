@@ -81,6 +81,7 @@ class Wait:
 class Generate:
     max_tokens: int
     recorded_assistant: dict[str, Any] | None = None
+    recorded_output_token_ids: list[int] | None = None
     source_model: str | None = None
     source_timestamp: str | None = None
 
@@ -91,6 +92,20 @@ class Generate:
             role = self.recorded_assistant.get("role", "assistant")
             if role != "assistant":
                 raise ValueError("recorded_assistant role must be assistant")
+        if self.recorded_output_token_ids is not None:
+            if len(self.recorded_output_token_ids) != self.max_tokens:
+                raise ValueError(
+                    "recorded_output_token_ids length must equal max_tokens"
+                )
+            if any(
+                isinstance(token_id, bool)
+                or not isinstance(token_id, int)
+                or token_id < 0
+                for token_id in self.recorded_output_token_ids
+            ):
+                raise ValueError(
+                    "recorded_output_token_ids must contain non-negative integers"
+                )
 
 
 @dataclass
@@ -152,6 +167,9 @@ class ReplayTrace:
                     Generate(
                         max_tokens=int(raw_event["max_tokens"]),
                         recorded_assistant=raw_event.get("recorded_assistant"),
+                        recorded_output_token_ids=raw_event.get(
+                            "recorded_output_token_ids"
+                        ),
                         source_model=raw_event.get("source_model"),
                         source_timestamp=raw_event.get("source_timestamp"),
                     )
@@ -193,6 +211,10 @@ class ReplayTrace:
                 }
                 if event.recorded_assistant is not None:
                     raw_event["recorded_assistant"] = event.recorded_assistant
+                if event.recorded_output_token_ids is not None:
+                    raw_event["recorded_output_token_ids"] = (
+                        event.recorded_output_token_ids
+                    )
                 if event.source_model is not None:
                     raw_event["source_model"] = event.source_model
                 if event.source_timestamp is not None:

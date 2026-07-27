@@ -157,11 +157,12 @@ waits, user think time, and context replacement after compaction or reset.
   "events": [
     {
       "type": "generate",
-      "max_tokens": 64,
+      "max_tokens": 3,
       "recorded_assistant": {
         "role": "assistant",
         "content": "I will inspect the logs."
-      }
+      },
+      "recorded_output_token_ids": [1001, 1002, 2]
     },
     {"type": "wait", "seconds": 1.2, "actor": "tool"},
     {
@@ -192,6 +193,14 @@ are available:
   deterministic. On a trace's first pass, reuse from the preceding request ends
   where live and recorded continuations diverge; repeated identical prompts can
   still be fully reused from the server cache.
+
+With the SGLang extension, `strict_replay=true` also forces every generated
+token to the trace sequence and validates the server response. Populate
+`recorded_output_token_ids` with exactly `max_tokens` IDs for exact replay.
+Older text-only traces remain supported: before timing starts, Trie derives a
+deterministic equal-length sequence from each recorded assistant response.
+See [docs/strict-replay-sglang.md](docs/strict-replay-sglang.md) for the old
+trace limitations and MTP verification semantics.
 
 For replay requests, the client asks vLLM to return the authoritative prompt
 and generated token IDs. It computes the exact LCP between the previous

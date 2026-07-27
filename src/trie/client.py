@@ -67,6 +67,14 @@ class GenerationResult:
     usage: CompletionUsage | None = None
 
 
+@dataclass
+class _ReplayGenerationTokens:
+    event: Generate
+    prompt: str
+    completed_context: str | None
+    assistant_payload_ids: list[int] | None
+
+
 def _extension_field(value: object, field: str) -> Any:
     if isinstance(value, dict):
         return value.get(field)
@@ -146,6 +154,7 @@ class Client:
         self._rng = random.Random(seed)
         self._result: BenchmarkResult | None = None
         self._benchmark_start: float | None = None
+        self._strict_replay_output_ids: dict[int, list[int]] = {}
 
     async def _execute_stream_request(
         self,
@@ -157,6 +166,7 @@ class Client:
         cache_salt: str | None = None,
         return_token_ids: bool = False,
         deterministic_sampling: bool = False,
+        forced_output_token_ids: list[int] | None = None,
     ) -> GenerationResult:
         request_start = time.perf_counter()
         extra_body: dict[str, object] = {"ignore_eos": True}
@@ -164,6 +174,8 @@ class Client:
             extra_body["return_token_ids"] = True
         if deterministic_sampling:
             extra_body["top_k"] = 1
+        if forced_output_token_ids is not None:
+            extra_body["forced_output_token_ids"] = list(forced_output_token_ids)
         if cache_salt is not None:
             extra_body["cache_salt"] = cache_salt
         request_kwargs: dict[str, object] = {}
@@ -292,6 +304,7 @@ class Client:
         cache_salt: str | None = None,
         return_token_ids: bool = False,
         deterministic_sampling: bool = False,
+        forced_output_token_ids: list[int] | None = None,
     ) -> GenerationResult:
         if stream:
             return await self._execute_stream_request(
@@ -302,6 +315,7 @@ class Client:
                 cache_salt=cache_salt,
                 return_token_ids=return_token_ids,
                 deterministic_sampling=deterministic_sampling,
+                forced_output_token_ids=forced_output_token_ids,
             )
 
         extra_body: dict[str, object] = {"ignore_eos": True}
@@ -309,6 +323,8 @@ class Client:
             extra_body["return_token_ids"] = True
         if deterministic_sampling:
             extra_body["top_k"] = 1
+        if forced_output_token_ids is not None:
+            extra_body["forced_output_token_ids"] = list(forced_output_token_ids)
         if cache_salt is not None:
             extra_body["cache_salt"] = cache_salt
         request_kwargs: dict[str, object] = {}
@@ -455,6 +471,145 @@ class Client:
             generation.generated_token_ids[:text_budget]
         )
 
+    def _prepare_strict_replay_output_ids(
+        self,
+        traces: list[ReplayTrace],
+    ) -> None:
+        prepared: dict[int, list[int]] = {}
+        explicit_events = 0
+        canonical_events = 0
+        ambiguous_events = 0
+
+        for trace in traces:
+            messages = copy.deepcopy(trace.initial_messages)
+            generations: list[_ReplayGenerationTokens] = []
+            request_index = 0
+            for event in trace.events:
+                if isinstance(event, AppendMessage):
+                    messages.append(copy.deepcopy(event.message))
+                    continue
+                if isinstance(event, ReplaceContext):
+                    messages = copy.deepcopy(event.messages)
+                    continue
+                if isinstance(event, Wait):
+                    continue
+
+                assert isinstance(event, Generate)
+                if event.recorded_assistant is None:
+                    raise ValueError(
+                        "strict replay requires recorded_assistant: "
+                        f"trace={trace.trace_id!r} request={request_index}"
+                    )
+                prompt = self._tokenizer_manager.render_chat(
+                    messages,
+                    tools=trace.tools,
+                    add_generation_prompt=True,
+                    reasoning_effort=self._reasoning_effort,
+                )
+                if event.recorded_output_token_ids is not None:
+                    generations.append(
+                        _ReplayGenerationTokens(event, prompt, None, None)
+                    )
+                    explicit_events += 1
+                else:
+                    completed_context = self._tokenizer_manager.render_chat(
+                        messages + [copy.deepcopy(event.recorded_assistant)],
+                        tools=trace.tools,
+                        add_generation_prompt=False,
+                        reasoning_effort=self._reasoning_effort,
+                    )
+                    if not completed_context.startswith(prompt):
+                        raise ValueError(
+                            "recorded assistant is not a tokenizable continuation "
+                            "of its prompt: "
+                            f"trace={trace.trace_id!r} request={request_index}"
+                        )
+                    continuation = completed_context[len(prompt) :]
+                    assistant_payload_ids = self._tokenizer_manager.encode(
+                        continuation
+                    )
+
+                    # Validate the generation boundary without re-tokenizing the
+                    # potentially very large context.
+                    prompt_tail = prompt[-1024:]
+                    boundary_ids = self._tokenizer_manager.encode(prompt_tail)
+                    combined_ids = self._tokenizer_manager.encode(
+                        prompt_tail + continuation
+                    )
+                    if (
+                        combined_ids[: len(boundary_ids)] != boundary_ids
+                        or combined_ids[len(boundary_ids) :] != assistant_payload_ids
+                    ):
+                        raise ValueError(
+                            "recorded assistant tokenization crosses the prompt "
+                            "boundary: "
+                            f"trace={trace.trace_id!r} request={request_index}"
+                        )
+                    generations.append(
+                        _ReplayGenerationTokens(
+                            event,
+                            prompt,
+                            completed_context,
+                            assistant_payload_ids,
+                        )
+                    )
+                    canonical_events += 1
+
+                messages.append(copy.deepcopy(event.recorded_assistant))
+                request_index += 1
+
+            for index, generation in enumerate(generations):
+                event = generation.event
+                if event.recorded_output_token_ids is not None:
+                    prepared[id(event)] = list(event.recorded_output_token_ids)
+                    continue
+
+                assert generation.assistant_payload_ids is not None
+                payload_ids = generation.assistant_payload_ids
+                if len(payload_ids) >= event.max_tokens:
+                    output_ids = payload_ids[: event.max_tokens]
+                    if len(payload_ids) != event.max_tokens:
+                        ambiguous_events += 1
+                else:
+                    terminal_id = self._tokenizer_manager.eos_token_id()
+                    recorded = event.recorded_assistant
+                    assert recorded is not None
+                    if recorded.get("tool_calls") and index + 1 < len(generations):
+                        completed_context = generation.completed_context
+                        assert completed_context is not None
+                        next_prompt = generations[index + 1].prompt
+                        if next_prompt.startswith(completed_context):
+                            separator = next_prompt[len(completed_context) :][:1024]
+                            separator_ids = self._tokenizer_manager.encode(separator)
+                            if separator_ids:
+                                terminal_id = separator_ids[0]
+
+                    missing = event.max_tokens - len(payload_ids)
+                    filler_ids = self._tokenizer_manager.encode("\n")
+                    filler_id = filler_ids[0] if filler_ids else terminal_id
+                    output_ids = (
+                        payload_ids
+                        + [filler_id] * max(missing - 1, 0)
+                        + [terminal_id]
+                    )
+                    if missing != 1:
+                        ambiguous_events += 1
+
+                if len(output_ids) != event.max_tokens:
+                    raise AssertionError("strict replay output length mismatch")
+                prepared[id(event)] = output_ids
+
+        self._strict_replay_output_ids = prepared
+        log_preparation = logger.warning if ambiguous_events else logger.info
+        log_preparation(
+            "prepared strict replay token streams",
+            traces=len(traces),
+            events=len(prepared),
+            explicit_token_events=explicit_events,
+            canonical_text_events=canonical_events,
+            ambiguous_text_events=ambiguous_events,
+        )
+
     async def _run_replay_trace(
         self,
         trace: ReplayTrace,
@@ -483,6 +638,13 @@ class Client:
             cache_salt = f"{run_cache_salt}:{trace.trace_id}:{uuid.uuid4().hex}"
         else:
             cache_salt = None
+
+        if strict_replay and any(
+            id(event) not in getattr(self, "_strict_replay_output_ids", {})
+            for event in trace.events
+            if isinstance(event, Generate)
+        ):
+            self._prepare_strict_replay_output_ids([trace])
 
         try:
             if trace.start_offset_s:
@@ -514,15 +676,25 @@ class Client:
                     add_generation_prompt=True,
                     reasoning_effort=self._reasoning_effort,
                 )
+                forced_output_token_ids = (
+                    self._strict_replay_output_ids[id(event)]
+                    if strict_replay
+                    else None
+                )
                 generation = await self._execute_request(
                     prompt,
-                    event.max_tokens,
+                    (
+                        len(forced_output_token_ids)
+                        if forced_output_token_ids is not None
+                        else event.max_tokens
+                    ),
                     stream=stream,
                     trace_start=trace_start,
                     stream_acc=stream_acc,
                     cache_salt=cache_salt,
                     return_token_ids=True,
                     deterministic_sampling=strict_replay,
+                    forced_output_token_ids=forced_output_token_ids,
                 )
                 prompt_token_ids = generation.prompt_token_ids
                 generated_token_ids = generation.generated_token_ids
@@ -532,6 +704,14 @@ class Client:
                     )
                 if generated_token_ids is None:
                     raise ValueError("return_token_ids response missing token_ids")
+                if (
+                    forced_output_token_ids is not None
+                    and generated_token_ids != forced_output_token_ids
+                ):
+                    raise ValueError(
+                        "server output token IDs differ from strict replay trace: "
+                        f"trace={trace.trace_id!r} request={request_index}"
+                    )
                 client_prefix = (
                     common_prefix_length(previous_actual_ids, prompt_token_ids)
                     if previous_actual_ids is not None
@@ -743,6 +923,15 @@ class Client:
             if any(not isinstance(item, ReplayTrace) for item in workload_list):
                 raise ValueError("strict_replay only supports schema-v2 replay traces")
             context_source = "recorded"
+            self._prepare_strict_replay_output_ids(
+                [
+                    item
+                    for item in workload_list
+                    if isinstance(item, ReplayTrace)
+                ]
+            )
+        else:
+            self._strict_replay_output_ids = {}
         run_cache_salt = uuid.uuid4().hex if cache_salt_mode == "session" else None
         benchmark_log_fields = {
             "model": self._model,
