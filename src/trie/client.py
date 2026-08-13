@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from itertools import cycle
 from typing import Any, Literal
 
+import httpx
 import structlog
 from openai import AsyncOpenAI, OpenAIError
 from openai.types.completion_usage import CompletionUsage
@@ -391,7 +392,7 @@ class Client:
                 stream_acc.commit(result)
         except asyncio.CancelledError:
             return
-        except (OpenAIError, ValueError) as e:
+        except (OpenAIError, ValueError, httpx.HTTPError) as e:
             result.record_failure()
             logger.warning("request failed", error=str(e), turn=turns_completed)
         refresh()
@@ -431,10 +432,13 @@ class Client:
         )
         if text_budget == 0:
             return ""
-        assert generation.generated_token_ids is not None
-        return self._tokenizer_manager.decode(
-            generation.generated_token_ids[:text_budget]
-        )
+        if generation.generated_token_ids is not None:
+            return self._tokenizer_manager.decode(
+                generation.generated_token_ids[:text_budget]
+            )
+        # 降级：服务端不回传 token ID 时用本地 tokenizer 近似截断
+        generated_ids = self._tokenizer_manager.encode(generation.text or "")
+        return self._tokenizer_manager.decode(generated_ids[:text_budget])
 
     async def _run_replay_trace(
         self,
@@ -504,29 +508,38 @@ class Client:
                 )
                 prompt_token_ids = generation.prompt_token_ids
                 generated_token_ids = generation.generated_token_ids
-                if prompt_token_ids is None:
-                    raise ValueError(
-                        "return_token_ids response missing prompt_token_ids"
+                if prompt_token_ids is None or generated_token_ids is None:
+                    # return_token_ids 是 vLLM 扩展；sglang 不回传 token ID 时
+                    # 降级运行：丢失 client prefix overlap / eligible cache hit
+                    # 两个核验指标，服务端上报的 cached_tokens 不受影响。
+                    if not getattr(self, "_token_ids_degraded_warned", False):
+                        self._token_ids_degraded_warned = True
+                        logger.warning(
+                            "server does not return token ids; "
+                            "client prefix / eligible cache metrics disabled"
+                        )
+                    client_prefix = 0
+                    block_prefix = 0
+                    next_actual_ids = None
+                else:
+                    client_prefix = (
+                        common_prefix_length(previous_actual_ids, prompt_token_ids)
+                        if previous_actual_ids is not None
+                        else 0
                     )
-                if generated_token_ids is None:
-                    raise ValueError("return_token_ids response missing token_ids")
-                client_prefix = (
-                    common_prefix_length(previous_actual_ids, prompt_token_ids)
-                    if previous_actual_ids is not None
-                    else 0
-                )
-                reusable_prefix = (
-                    min(
-                        client_prefix,
-                        max(len(previous_actual_ids) - 1, 0),
-                        max(len(prompt_token_ids) - 1, 0),
+                    reusable_prefix = (
+                        min(
+                            client_prefix,
+                            max(len(previous_actual_ids) - 1, 0),
+                            max(len(prompt_token_ids) - 1, 0),
+                        )
+                        if previous_actual_ids is not None
+                        else 0
                     )
-                    if previous_actual_ids is not None
-                    else 0
-                )
-                block_prefix = block_aligned_prefix_length(
-                    reusable_prefix, prefix_block_size
-                )
+                    block_prefix = block_aligned_prefix_length(
+                        reusable_prefix, prefix_block_size
+                    )
+                    next_actual_ids = prompt_token_ids + generated_token_ids
                 cached_tokens = generation.cached_tokens
                 if generation.usage is not None:
                     cached_tokens = metrics.record_usage(
@@ -545,7 +558,7 @@ class Client:
                 request_index += 1
                 refresh()
 
-                previous_actual_ids = prompt_token_ids + generated_token_ids
+                previous_actual_ids = next_actual_ids
                 if context_source == "recorded":
                     if event.recorded_assistant is None:
                         raise ValueError(
@@ -580,7 +593,7 @@ class Client:
                 stream_acc.commit(result)
         except asyncio.CancelledError:
             return
-        except (OpenAIError, ValueError) as exc:
+        except (OpenAIError, ValueError, httpx.HTTPError) as exc:
             result.record_failure()
             logger.warning(
                 "replay trace failed",
